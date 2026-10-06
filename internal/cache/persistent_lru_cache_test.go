@@ -20,6 +20,14 @@ import (
 	"github.com/kopia/kopia/repo/blob"
 )
 
+// newTestStorage creates a cache.Storage backed by the provided data map with
+// the given byte limit, using a type assertion to satisfy cache.Storage.
+func newTestStorage(t *testing.T, data blobtesting.DataMap, limitBytes uint64) cache.Storage {
+	t.Helper()
+
+	return testutil.EnsureType[cache.Storage](t, blobtesting.NewMapStorageWithLimit(data, nil, nil, limitBytes))
+}
+
 func TestPersistentLRUCache(t *testing.T) {
 	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
 
@@ -353,4 +361,133 @@ func verifyBlobDoesNotExist(ctx context.Context, t *testing.T, st cache.Storage,
 
 	_, err := st.GetMetadata(ctx, blobID)
 	require.ErrorIsf(t, err, blob.ErrBlobNotFound, "expected blob not found for '%s'", blobID)
+}
+
+// TestPersistentLRUCache_DiskFreeSpaceAmple verifies that when free disk space
+// is plentiful, MaxSizeBytes is used unchanged as the effective soft limit.
+func TestPersistentLRUCache_DiskFreeSpaceAmple(t *testing.T) {
+	t.Parallel()
+
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
+
+	const maxSizeBytes = 1000
+
+	data := blobtesting.DataMap{}
+	st := newTestStorage(t, data, maxSizeBytes)
+
+	// Report very large free space – MaxSizeBytes should govern.
+	const ampleFreeDiskBytes uint64 = 100 * 1024 * 1024 * 1024 // 100 GiB
+
+	pc, err := cache.NewPersistentCache(ctx, "testing", st, nil, cache.SweepSettings{
+		MaxSizeBytes:    maxSizeBytes,
+		DiskFreeSpaceFn: func() (uint64, error) { return ampleFreeDiskBytes, nil },
+	}, nil, clock.Now)
+	require.NoError(t, err)
+
+	// Put 4 items of 300 bytes each → total 1200 bytes, above the 1000-byte limit.
+	// Oldest item must be swept.
+	item := bytes.Repeat([]byte{1}, 300)
+
+	pc.Put(ctx, "k1", gather.FromSlice(item))
+	pc.Put(ctx, "k2", gather.FromSlice(item))
+	pc.Put(ctx, "k3", gather.FromSlice(item))
+	pc.Put(ctx, "k4", gather.FromSlice(item))
+
+	pc.Close(ctx)
+
+	// k1 should have been evicted; k2-k4 retained (same as default sweep behavior).
+	require.NotContains(t, data, blob.ID("k1"), "oldest item must be evicted when above MaxSizeBytes")
+	require.Contains(t, data, blob.ID("k2"), "k2 must be retained")
+	require.Contains(t, data, blob.ID("k3"), "k3 must be retained")
+	require.Contains(t, data, blob.ID("k4"), "k4 must be retained")
+}
+
+// TestPersistentLRUCache_DiskFreeSpaceLow verifies that when free disk space
+// drops below MinFreeDiskBytes the effective limit is reduced and items are
+// swept even when the cache is below MaxSizeBytes.
+func TestPersistentLRUCache_DiskFreeSpaceLow(t *testing.T) {
+	t.Parallel()
+
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
+
+	// Use a large MaxSizeBytes so the configured limit would never trigger a
+	// sweep on its own; only the disk-space check should trigger it.
+	const maxSizeBytes = 10 * 1024 * 1024 // 10 MiB
+
+	data := blobtesting.DataMap{}
+	st := newTestStorage(t, data, maxSizeBytes)
+
+	// Start with ample free space so initial items are admitted.
+	freeBytes := uint64(cache.MinFreeDiskBytes) * 10
+
+	pc, err := cache.NewPersistentCache(ctx, "testing", st, nil, cache.SweepSettings{
+		MaxSizeBytes: maxSizeBytes,
+		MinSweepAge:  0, // allow immediate eviction
+		DiskFreeSpaceFn: func() (uint64, error) {
+			return freeBytes, nil
+		},
+	}, nil, clock.Now)
+	require.NoError(t, err)
+
+	// Write two items while space is ample.
+	item := bytes.Repeat([]byte{2}, 300)
+
+	pc.Put(ctx, "k1", gather.FromSlice(item))
+	pc.Put(ctx, "k2", gather.FromSlice(item))
+
+	require.Len(t, data, 2, "both items should be cached with ample free space")
+
+	// Simulate free space dropping below MinFreeDiskBytes.
+	// Set it to 0 so the effective limit drops below the current cache size.
+	freeBytes = 0
+
+	// Adding a third item triggers sweepLocked which now sees 0 free bytes;
+	// the effective limit = cacheOnDisk + 0 - MinFreeDiskBytes < 0, so the
+	// sweep must evict the oldest item(s).
+	pc.Put(ctx, "k3", gather.FromSlice(item))
+
+	pc.Close(ctx)
+
+	// At least one item must have been evicted to bring the cache under the
+	// disk-space-adjusted effective limit.
+	require.Less(t, len(data), 3, "items must be evicted when free disk space is below MinFreeDiskBytes")
+}
+
+// TestPersistentLRUCache_DiskFreeSpaceErrorFallback verifies that when
+// DiskFreeSpaceFn returns an error the cache falls back to MaxSizeBytes,
+// preserving the existing behavior.
+func TestPersistentLRUCache_DiskFreeSpaceErrorFallback(t *testing.T) {
+	t.Parallel()
+
+	ctx := testlogging.ContextWithLevel(t, testlogging.LevelInfo)
+
+	const maxSizeBytes = 1000
+
+	data := blobtesting.DataMap{}
+	st := newTestStorage(t, data, maxSizeBytes)
+
+	diskErr := errors.New("disk query failed")
+
+	pc, err := cache.NewPersistentCache(ctx, "testing", st, nil, cache.SweepSettings{
+		MaxSizeBytes:    maxSizeBytes,
+		DiskFreeSpaceFn: func() (uint64, error) { return 0, diskErr },
+	}, nil, clock.Now)
+	require.NoError(t, err)
+
+	// Same scenario as TestPersistentLRUCache: 4 × 300 bytes > 1000-byte limit.
+	item := bytes.Repeat([]byte{3}, 300)
+
+	pc.Put(ctx, "k1", gather.FromSlice(item))
+	pc.Put(ctx, "k2", gather.FromSlice(item))
+	pc.Put(ctx, "k3", gather.FromSlice(item))
+	pc.Put(ctx, "k4", gather.FromSlice(item))
+
+	pc.Close(ctx)
+
+	// With a failing DiskFreeSpaceFn, behavior matches the default sweep:
+	// MaxSizeBytes governs and k1 is evicted.
+	require.NotContains(t, data, blob.ID("k1"), "k1 must be evicted by MaxSizeBytes fallback")
+	require.Contains(t, data, blob.ID("k2"))
+	require.Contains(t, data, blob.ID("k3"))
+	require.Contains(t, data, blob.ID("k4"))
 }

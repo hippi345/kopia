@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/ospath"
+	"github.com/kopia/kopia/internal/volumesizeinfo"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/blob/filesystem"
 	"github.com/kopia/kopia/repo/blob/sharded"
@@ -34,6 +35,30 @@ type Storage interface {
 // but prevents casting to blob.Storage.
 type filesystemImplWrapper struct {
 	Storage
+}
+
+// MakeDiskFreeSpaceFn returns a function that reports the number of free bytes
+// available on the filesystem that contains dir. The returned function is safe
+// to call concurrently. It is intended for use as SweepSettings.DiskFreeSpaceFn.
+// If dir is empty, MakeDiskFreeSpaceFn returns nil.
+func MakeDiskFreeSpaceFn(dir string) func() (uint64, error) {
+	if dir == "" {
+		return nil
+	}
+
+	return func() (uint64, error) {
+		info, err := volumesizeinfo.GetVolumeSizeInfo(dir)
+		if err != nil {
+			return 0, err //nolint:wrapcheck
+		}
+
+		// TotalSize - UsedSize gives the free space on the volume.
+		if info.UsedSize > info.TotalSize {
+			return 0, nil
+		}
+
+		return info.TotalSize - info.UsedSize, nil
+	}
 }
 
 // NewStorageOrNil returns cache.Storage backed by the provided directory.

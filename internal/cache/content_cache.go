@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"path/filepath"
 	"time"
 
 	"github.com/pkg/errors"
@@ -185,6 +186,12 @@ func NewContentCache(ctx context.Context, st blob.Storage, opt Options, mr *metr
 		if err != nil {
 			return nil, errors.Wrap(err, "error initializing cache storage")
 		}
+	}
+
+	// Set up disk-free-space protection when a real cache directory is used and the
+	// caller has not already configured a custom DiskFreeSpaceFn.
+	if opt.Sweep.DiskFreeSpaceFn == nil && opt.BaseCacheDirectory != "" {
+		opt.Sweep.DiskFreeSpaceFn = MakeDiskFreeSpaceFn(filepath.Join(opt.BaseCacheDirectory, opt.CacheSubDir))
 	}
 
 	pc, err := NewPersistentCache(ctx, opt.CacheSubDir, cacheStorage, cacheprot.ChecksumProtection(opt.HMACSecret), opt.Sweep, mr, opt.TimeNow)

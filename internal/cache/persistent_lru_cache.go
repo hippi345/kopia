@@ -275,17 +275,40 @@ func (h *contentMetadataHeap) Pop() any {
 }
 
 // +checklocks:c.listCacheMutex
-func (c *PersistentCache) aboveSoftLimit(extraBytes int64) bool {
-	return c.listCache.totalDataBytes+extraBytes+c.pendingWriteBytes > c.sweep.MaxSizeBytes
-}
-
-// +checklocks:c.listCacheMutex
 func (c *PersistentCache) aboveHardLimit(extraBytes int64) bool {
 	if c.sweep.LimitBytes <= 0 {
 		return false
 	}
 
 	return c.listCache.totalDataBytes+extraBytes+c.pendingWriteBytes > c.sweep.LimitBytes
+}
+
+// effectiveSoftLimitLocked returns the effective soft limit for the cache,
+// which may be lower than MaxSizeBytes when disk free space is constrained.
+//
+// +checklocks:c.listCacheMutex
+func (c *PersistentCache) effectiveSoftLimitLocked(ctx context.Context) int64 {
+	maxSize := c.sweep.MaxSizeBytes
+	if c.sweep.DiskFreeSpaceFn == nil || maxSize <= 0 {
+		return maxSize
+	}
+
+	freeBytes, err := c.sweep.DiskFreeSpaceFn()
+	if err != nil {
+		log(ctx).Warnw("unable to determine free disk space for cache", "cache", c.description, "err", err)
+		return maxSize
+	}
+
+	// Allow the cache to occupy at most (currentSize + freeBytes - MinFreeDiskBytes).
+	// This keeps at least MinFreeDiskBytes available on the disk.
+	cacheOnDisk := c.listCache.totalDataBytes + c.pendingWriteBytes
+	budget := cacheOnDisk + int64(freeBytes) - MinFreeDiskBytes //nolint:gosec
+
+	if budget < maxSize {
+		return budget
+	}
+
+	return maxSize
 }
 
 // +checklocks:c.listCacheMutex
@@ -296,7 +319,10 @@ func (c *PersistentCache) sweepLocked(ctx context.Context) {
 		now                     = c.timeNow()
 	)
 
-	for len(c.listCache.data) > 0 && (c.aboveSoftLimit(unsuccessfulDeleteBytes) || c.aboveHardLimit(unsuccessfulDeleteBytes)) {
+	// Compute effective soft limit once per sweep, accounting for free disk space.
+	effectiveMax := c.effectiveSoftLimitLocked(ctx)
+
+	for len(c.listCache.data) > 0 && (c.listCache.totalDataBytes+unsuccessfulDeleteBytes+c.pendingWriteBytes > effectiveMax || c.aboveHardLimit(unsuccessfulDeleteBytes)) {
 		// examine the oldest cache item without removing it from the heap.
 		oldest := c.listCache.data[0]
 
@@ -404,6 +430,10 @@ func (c *PersistentCache) sharedUnlock(key string) {
 	}
 }
 
+// MinFreeDiskBytes is the minimum number of free bytes the cache sweep aims
+// to preserve on the cache filesystem when DiskFreeSpaceFn is configured.
+const MinFreeDiskBytes int64 = 128 << 20 // 128 MiB
+
 // SweepSettings encapsulates settings that impact cache item sweep/expiration.
 type SweepSettings struct {
 	// soft limit, the cache will be limited to this size, except for items newer than MinSweepAge.
@@ -418,6 +448,13 @@ type SweepSettings struct {
 
 	// on each use, items will be touched if they have not been touched in this long.
 	TouchThreshold time.Duration
+
+	// DiskFreeSpaceFn, when set, is called during each sweep to query the number of free
+	// bytes available on the cache filesystem. The sweep reduces the effective MaxSizeBytes
+	// so that at least MinFreeDiskBytes remain available. When free space is already below
+	// MinFreeDiskBytes the cache is swept below its current size to reclaim disk space.
+	// Set this to enable disk-full protection; leave nil to use only MaxSizeBytes.
+	DiskFreeSpaceFn func() (uint64, error)
 }
 
 func (s SweepSettings) applyDefaults() SweepSettings {
